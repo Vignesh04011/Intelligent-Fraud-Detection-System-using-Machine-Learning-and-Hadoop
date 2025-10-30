@@ -1,0 +1,10 @@
+streamlit
+pandas
+pyhive
+thrift
+thrift_sasl
+sasl
+plotly
+torch
+joblib
+scikit-learn

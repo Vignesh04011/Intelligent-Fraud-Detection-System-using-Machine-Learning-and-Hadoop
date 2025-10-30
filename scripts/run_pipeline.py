@@ -1,153 +1,105 @@
-# scripts/run_pipeline.py
+import sys
 import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))  # add scripts/ to path
+
 import pandas as pd
-import torch
-import torch.nn as nn
 import numpy as np
+import torch
 import joblib
-from sklearn.ensemble import IsolationForest
+from model_def import FraudAutoEncoder  # now works reliably
 
-# ---------------- Load Autoencoder -----------------
-class AutoEncoder(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 8),
-            nn.ReLU(),
-            nn.Linear(8, 4),
-            nn.ReLU()
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(4, 8),
-            nn.ReLU(),
-            nn.Linear(8, input_dim)
-        )
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
+def main():
+    try:
+        # ---------------- Load CSV ----------------
+        input_path = "data/raw/uploaded_subsidy_claims.csv"
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"{input_path} not found.")
+        df = pd.read_csv(input_path)
+        df['Date'] = pd.to_datetime(df['Date'])
+        identifiers = df[['Name', 'Aadhaar']]
 
-def load_autoencoder():
-    model_path = "artifacts/models/fraud_autoencoder.pt"
-    scaler_path = "artifacts/models/scaler.pkl"
-    enc_path = "artifacts/models/encoder.pkl"
-    if not os.path.exists(model_path):
-        print("⚠️ Autoencoder not found, skipping deep anomaly detection.")
-        return None, None, None
-    scaler = joblib.load(scaler_path)
-    enc = joblib.load(enc_path)
-    sample = np.hstack([scaler.transform([[0]]),
-                        enc.transform([["Education"]])])
-    model = AutoEncoder(input_dim=sample.shape[1])
-    model.load_state_dict(torch.load(model_path, map_location="cpu"))
-    model.eval()
-    return model, scaler, enc
+        # ---------------- Rule-based Detection ----------------
+        df['RuleFraud'] = ''
+        # Duplicate Aadhaar used by multiple names
+        aadhaar_counts = df.groupby('Aadhaar')['Name'].nunique()
+        duplicate_aadhaar = aadhaar_counts[aadhaar_counts > 1].index.tolist()
+        df.loc[df['Aadhaar'].isin(duplicate_aadhaar), 'RuleFraud'] += 'DuplicateAadhaar;'
 
-# ---------------- Cleaning & Rule Checks -----------------
-def clean_data(input_csv, cleaned_csv):
-    df = pd.read_csv(input_csv)
-    df.dropna(subset=['Name','Aadhaar','ClaimAmount','SubsidyType','Date'], inplace=True)
-    df['Aadhaar'] = df['Aadhaar'].astype(str)
-    df['ClaimAmount'] = pd.to_numeric(df['ClaimAmount'], errors='coerce')
-    df.to_csv(cleaned_csv, index=False)
-    return df
+        # Same Name with multiple Aadhaar numbers
+        name_counts = df.groupby('Name')['Aadhaar'].nunique()
+        multi_aadhaar = name_counts[name_counts > 1].index.tolist()
+        df.loc[df['Name'].isin(multi_aadhaar), 'RuleFraud'] += 'MultiAadhaar;'
 
-def detect_fraud(df):
-    """
-    Detects fraud using:
-    - Duplicate Aadhaar
-    - Duplicate Claims (same Name + SubsidyType)
-    - ML Anomaly on ClaimAmount
-    - Temporal Fraud (multiple claims in short time)
-    - Subsidy Overlap (many subsidy types in short window)
-    """
-    # Ensure proper datetime
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df = df.sort_values(by=['Aadhaar', 'Date'])
+        # High ClaimAmount (99th percentile)
+        threshold_amount = df['ClaimAmount'].quantile(0.99)
+        df.loc[df['ClaimAmount'] > threshold_amount, 'RuleFraud'] += 'HighClaimAmount;'
 
-    # --- 1️⃣ Rule-based duplicates ---
-    df['AadhaarFlag'] = df.duplicated(subset=['Aadhaar'], keep=False)
-    df['ClaimFlag'] = df.duplicated(subset=['Name', 'SubsidyType'], keep=False)
+        # Frequent claims within 7 days
+        df = df.sort_values(['Aadhaar', 'Date'])
+        df['PrevDate'] = df.groupby('Aadhaar')['Date'].shift(1)
+        df['DaysDiff'] = (df['Date'] - df['PrevDate']).dt.days
+        df.loc[df['DaysDiff'] <= 7, 'RuleFraud'] += 'FrequentClaims;'
 
-    # --- 2️⃣ Temporal Fraud (same Aadhaar, claims < 3 days apart) ---
-    df['TemporalFlag'] = False
-    for aadhaar, group in df.groupby('Aadhaar'):
-        if len(group) > 1:
-            dates = group['Date'].sort_values().values
-            diffs = np.diff(dates).astype('timedelta64[D]').astype(int)
-            if any(d <= 3 for d in diffs):
-                df.loc[df['Aadhaar'] == aadhaar, 'TemporalFlag'] = True
+        df['RuleFraud'] = df['RuleFraud'].replace('', 'Normal')
 
-    # --- 3️⃣ Subsidy Overlap Fraud (same Name, many subsidy types within 7 days) ---
-    df['OverlapFlag'] = False
-    for name, group in df.groupby('Name'):
-        if len(group) > 1:
-            for i, row in group.iterrows():
-                recent = group[
-                    (abs((group['Date'] - row['Date']).dt.days) <= 7)
-                ]
-                if recent['SubsidyType'].nunique() >= 3:
-                    df.loc[df['Name'] == name, 'OverlapFlag'] = True
-                    break
+        # ---------------- ML-based Detection ----------------
+        X = df[['ClaimAmount', 'SubsidyType', 'Date']].copy()
+        X['Date'] = (X['Date'] - X['Date'].min()).dt.days
 
-    # --- 4️⃣ Combine all rule-based flags ---
-    def combine_flags(row):
-        flags = []
-        if row['AadhaarFlag']:
-            flags.append("Duplicate Aadhaar")
-        if row['ClaimFlag']:
-            flags.append("Duplicate Claim")
-        if row['TemporalFlag']:
-            flags.append("Frequent Claims")
-        if row['OverlapFlag']:
-            flags.append("Subsidy Overlap")
-        return " | ".join(flags) if flags else None
+        encoder = joblib.load("models/encoder.pkl")
+        scaler = joblib.load("models/scaler.pkl")
 
-    df['FraudType'] = df.apply(combine_flags, axis=1)
+        X_cat = encoder.transform(X[['SubsidyType']])
+        X_num = scaler.transform(X[['ClaimAmount', 'Date']])
+        X_combined = np.hstack([X_num, X_cat])
+        X_tensor = torch.tensor(X_combined, dtype=torch.float32)
 
-    # --- 5️⃣ ML anomaly on ClaimAmount ---
-    if 'ClaimAmount' in df.columns:
-        model = IsolationForest(contamination=0.05, random_state=42)
-        df['ML_Anomaly'] = model.fit_predict(df[['ClaimAmount']])
-        df.loc[df['ML_Anomaly'] == -1, 'FraudType'] = (
-            df['FraudType'].fillna('') + " | ML Anomaly"
-        ).str.strip(" |")
+        input_dim = X_combined.shape[1]
+        model = FraudAutoEncoder(input_dim)
+        model.load_state_dict(torch.load("models/fraud_autoencoder.pt", map_location="cpu"))
+        model.eval()
 
-    return df
+        with torch.no_grad():
+            X_hat = model(X_tensor)
+            errors = torch.mean((X_tensor - X_hat)**2, axis=1).numpy()
 
-# ---------------- Deep Learning Inference -----------------
-def add_autoencoder_anomaly(df):
-    model, scaler, enc = load_autoencoder()
-    if model is None:
-        df['DL_Anomaly'] = False
-        return df
+        threshold = errors.mean() + 2 * errors.std()
+        df['MLFraud'] = ['Suspicious' if e > threshold else 'Normal' for e in errors]
 
-    feats = df[['ClaimAmount','SubsidyType']].copy()
-    sub_encoded = enc.transform(feats[['SubsidyType']])
-    claim_scaled = scaler.transform(feats[['ClaimAmount']])
-    X = np.hstack([claim_scaled, sub_encoded])
-    X_tensor = torch.tensor(X, dtype=torch.float32)
+        # ---------------- Combine Rule + ML ----------------
+        def combine_fraud(row):
+            if row['RuleFraud'] != 'Normal':
+                return row['RuleFraud']
+            elif row['MLFraud'] != 'Normal':
+                return row['MLFraud']
+            else:
+                return 'Normal'
 
-    with torch.no_grad():
-        recon = model(X_tensor)
-        loss = ((X_tensor - recon)**2).mean(dim=1).numpy()
-    threshold = np.percentile(loss, 95)   # top 5 % = anomalies
-    df['DL_Anomaly'] = loss > threshold
-    df.loc[df['DL_Anomaly'], 'FraudType'] = (
-        df['FraudType'].fillna('') + " | Deep Anomaly").str.strip(" |")
-    return df
+        df['FraudType'] = df.apply(combine_fraud, axis=1)
 
-# ---------------- Pipeline -----------------
-def run_pipeline():
-    raw_csv = "data/raw/uploaded_subsidy_claims.csv"
-    cleaned_csv = "data/cleaned/cleaned_subsidy_claims.csv"
-    flagged_csv = "data/results/fraud_flagged.csv"
-    os.makedirs(os.path.dirname(flagged_csv), exist_ok=True)
+        # ---------------- Save results ----------------
+        os.makedirs("data/results", exist_ok=True)
+        df_results = identifiers.copy()
+        df_results['ClaimAmount'] = df['ClaimAmount']
+        df_results['SubsidyType'] = df['SubsidyType']
+        df_results['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
+        df_results['ReconstructionError'] = errors
+        df_results['FraudType'] = df['FraudType']
+        df_results.to_csv("data/results/fraud_results.csv", index=False)
 
-    print("🚀 Starting FraudDetectX Pipeline...")
-    df = clean_data(raw_csv, cleaned_csv)
-    df = detect_fraud(df)
-    df = add_autoencoder_anomaly(df)
-    df.to_csv(flagged_csv, index=False)
-    print(f"✅ Results saved → {flagged_csv}")
+        # Write status file
+        with open("pipeline_status.txt", "w") as f:
+            f.write("success")
+
+        print("✅ Hybrid fraud detection complete. Results saved.")
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        with open("pipeline_status.txt", "w") as f:
+            f.write("failed")
+        exit(1)
+
 
 if __name__ == "__main__":
-    run_pipeline()
+    main()
